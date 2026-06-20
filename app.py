@@ -1,512 +1,273 @@
 import io
 import time
 import zipfile
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.sparse import csr_matrix, lil_matrix
-from scipy.sparse.csgraph import dijkstra
+from scipy.optimize import milp, LinearConstraint, Bounds
 
-try:
-    from scipy.optimize import milp, LinearConstraint, Bounds
-    SCIPY_MILP_AVAILABLE = True
-except Exception:
-    SCIPY_MILP_AVAILABLE = False
+st.set_page_config(page_title="Caso 2 · TSP", page_icon="🚚", layout="wide")
 
-BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-AMPL_DIR = BASE_DIR / "ampl"
+CSS = """
+<style>
+    .main {background-color: #ffffff;}
+    h1, h2, h3 {color: #2f3a4f;}
+    .subtitle {font-size: 18px; color: #64748b; font-style: italic; margin-bottom: 20px;}
+    .card {background:#f3f6fb; border:1px solid #d5dde8; border-radius:14px; padding:22px; box-shadow:0 2px 8px rgba(15,23,42,.06); min-height:110px;}
+    .answer {background:#ffffff; border-left:6px solid #242c66; border-radius:10px; padding:18px; margin:12px 0; box-shadow:0 1px 5px rgba(15,23,42,.08);}
+    .pill {display:inline-block; background:#242c66; color:white; border-radius:10px; padding:8px 14px; font-weight:700;}
+    .yellow {background:#f2aa00; color:#14213d;}
+    .route {background:#eef6ff; border:1px solid #bfdbfe; border-radius:12px; padding:18px; font-size:18px; line-height:1.8;}
+    code {font-size: 15px;}
+</style>
+"""
+st.markdown(CSS, unsafe_allow_html=True)
 
-st.set_page_config(
-    page_title="Caso Redes | Camino más corto + TSP",
-    page_icon="🚚",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+NODES = [0, 3, 10, 21, 22, 35, 40, 41, 47, 65, 71, 76, 77]
+D = np.array([
+[0,29,18,16,24,32,17,28,29,27,27,33,34],
+[29,0,38,40,29,48,15,57,27,53,55,24,44],
+[18,38,0,31,42,49,22,27,21,19,36,50,16],
+[16,40,31,0,21,18,32,25,45,30,16,34,47],
+[24,29,42,21,0,20,30,46,46,48,36,14,56],
+[32,48,49,18,20,0,45,40,60,47,25,33,65],
+[17,15,22,32,30,45,0,44,16,39,45,32,30],
+[28,57,27,25,46,40,44,0,48,11,17,59,41],
+[29,27,21,45,46,60,16,48,0,40,54,48,18],
+[27,53,19,30,48,47,39,11,40,0,26,60,30],
+[27,55,36,16,36,25,45,17,54,26,0,50,52],
+[33,24,50,34,14,33,32,59,48,60,50,0,62],
+[34,44,16,47,56,65,30,41,18,30,52,62,0]
+], dtype=float)
 
-st.markdown(
-    """
-    <style>
-    :root {--txt:#0f172a; --muted:#64748b; --line:#e2e8f0; --bg:#f8fafc; --card:#ffffff; --accent:#2563eb;}
-    .stApp {background: linear-gradient(180deg, #f8fafc 0%, #ffffff 55%);} 
-    .block-container {padding-top: 1.3rem; padding-bottom: 2.2rem; max-width: 1380px;}
-    .hero {
-        background: radial-gradient(circle at top left, #3b82f6 0%, #1e293b 42%, #020617 100%);
-        color: white; padding: 30px 32px; border-radius: 28px; margin-bottom: 18px;
-        box-shadow: 0 18px 40px rgba(15,23,42,.18);
-    }
-    .hero h1 {margin:0; font-size:2.15rem; line-height:1.15; font-weight:800;}
-    .hero p {margin:12px 0 0 0; color:#dbeafe; font-size:1.02rem; max-width:960px;}
-    .pill {display:inline-block; padding:7px 12px; border-radius:999px; background:rgba(255,255,255,.12); border:1px solid rgba(255,255,255,.22); margin-bottom:10px; font-size:.85rem;}
-    .card {background:#fff; border:1px solid #e2e8f0; border-radius:20px; padding:18px; margin:10px 0; box-shadow:0 8px 22px rgba(15,23,42,.045);} 
-    .soft {background:#f8fafc; border:1px solid #e2e8f0; border-radius:18px; padding:14px 16px;}
-    .ok {background:#ecfdf5; border:1px solid #bbf7d0; color:#14532d; border-radius:16px; padding:12px 14px;}
-    .warn {background:#fffbeb; border:1px solid #fde68a; color:#78350f; border-radius:16px; padding:12px 14px;}
-    div[data-testid="stMetric"] {background:#fff; border:1px solid #e2e8f0; border-radius:18px; padding:14px 16px; box-shadow:0 8px 22px rgba(15,23,42,.045);} 
-    div[data-testid="stMetricValue"] {font-size:1.65rem; font-weight:800; color:#0f172a;}
-    .small-note {font-size:.92rem; color:#475569;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    """
-    <div class="hero">
-      <span class="pill">II-1122 Optimización Industrial · Caso Redes</span>
-      <h1>Camino más corto + Problema del Agente Viajero</h1>
-      <p>App en Streamlit para cargar la red vial y los clientes, calcular la matriz Desde-Hasta con caminos más cortos, generar archivos AMPL y resolver el TSP con formulación MTZ cuando el entorno lo permita.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-@st.cache_data(show_spinner=False)
-def read_network(file_bytes: bytes):
-    lines = file_bytes.decode("utf-8", errors="ignore").strip().splitlines()
-    if not lines:
-        raise ValueError("El archivo de red está vacío.")
-    rows = []
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 3:
-            try:
-                rows.append((int(parts[0]), int(parts[1]), float(parts[2])))
-            except ValueError:
-                continue
-    if not rows:
-        raise ValueError("No se pudieron leer arcos con formato: NodoOrigen NodoDestino Distancia.")
-    arcs = pd.DataFrame(rows, columns=["origen", "destino", "distancia"])
-    n_nodes = int(arcs[["origen", "destino"]].max().max()) + 1
-    return n_nodes, arcs
-
-@st.cache_data(show_spinner=False)
-def read_clients(file_bytes: bytes):
-    vals = []
-    for line in file_bytes.decode("utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if line:
-            vals.append(int(line.split()[0]))
-    if not vals:
-        raise ValueError("El archivo de clientes está vacío.")
-    return vals
-
-@st.cache_data(show_spinner=True)
-def build_distance_matrix(n_nodes: int, arcs: pd.DataFrame, required_nodes_tuple):
-    required_nodes = list(required_nodes_tuple)
-    graph = csr_matrix((arcs["distancia"].to_numpy(), (arcs["origen"].to_numpy(), arcs["destino"].to_numpy())), shape=(n_nodes, n_nodes))
-    dist = dijkstra(csgraph=graph, directed=True, indices=required_nodes, return_predecessors=False)
-    return pd.DataFrame(dist[:, required_nodes], index=required_nodes, columns=required_nodes)
-
-@st.cache_data(show_spinner=True)
-def build_distance_and_paths(n_nodes: int, arcs: pd.DataFrame, required_nodes_tuple):
-    required_nodes = list(required_nodes_tuple)
-    graph = csr_matrix((arcs["distancia"].to_numpy(), (arcs["origen"].to_numpy(), arcs["destino"].to_numpy())), shape=(n_nodes, n_nodes))
-    dist, pred = dijkstra(csgraph=graph, directed=True, indices=required_nodes, return_predecessors=True)
-    matrix = pd.DataFrame(dist[:, required_nodes], index=required_nodes, columns=required_nodes)
-    return matrix, pred
-
-def reconstruct_path(pred_matrix, required_nodes, origin, dest):
-    source_row = required_nodes.index(origin)
-    if origin == dest:
-        return [origin]
-    path = [dest]
-    current = dest
-    seen = set()
-    while current != origin:
-        if current in seen:
-            return []
-        seen.add(current)
-        current = int(pred_matrix[source_row, current])
-        if current < 0:
-            return []
-        path.append(current)
-    return list(reversed(path))
-
-def make_tsp_dat(matrix: pd.DataFrame):
-    nodes = list(matrix.index)
-    lines = [
-        "set NODES := " + " ".join(map(str, nodes)) + ";",
-        "param depot := 0;",
-        "param d : " + " ".join(map(str, nodes)) + " :=",
-    ]
-    for i in nodes:
-        vals = []
-        for j in nodes:
-            value = float(matrix.loc[i, j])
-            if np.isinf(value):
-                value = 999999999
-            vals.append(str(int(round(value))))
-        lines.append(str(i) + " " + " ".join(vals))
-    lines.append(";")
-    return "\n".join(lines)
-
-def make_shortest_dat(n_nodes: int, arcs: pd.DataFrame, s: int, t: int):
-    lines = ["set NODES := " + " ".join(map(str, range(n_nodes))) + ";", "set ARCS :="]
-    for r in arcs.itertuples(index=False):
-        lines.append(f"({int(r.origen)},{int(r.destino)})")
-    lines.append(";")
-    lines.append("param c :=")
-    for r in arcs.itertuples(index=False):
-        lines.append(f"{int(r.origen)} {int(r.destino)} {float(r.distancia):g}")
-    lines.append(";")
-    lines.append(f"param s := {s};")
-    lines.append(f"param t := {t};")
-    return "\n".join(lines)
-
-def route_table(route, matrix: pd.DataFrame):
-    rows = []
-    total = 0
-    for k in range(len(route) - 1):
-        i, j = route[k], route[k + 1]
-        d = float(matrix.loc[i, j])
-        total += d
-        rows.append({"orden": k + 1, "desde": i, "hasta": j, "distancia tramo": d, "acumulado": total})
-    return pd.DataFrame(rows)
-
-def solve_tsp_mtz_scipy(matrix: pd.DataFrame, time_limit: int):
-    if not SCIPY_MILP_AVAILABLE:
-        raise RuntimeError("SciPy MILP no está disponible en este entorno.")
-    nodes = list(matrix.index)
-    depot = 0
-    n = len(nodes)
-    if np.isinf(matrix.values).any():
-        raise RuntimeError("Hay distancias infinitas en la matriz; revise conectividad de la red.")
-    arcs = [(i, j) for i in nodes for j in nodes if i != j]
-    arc_pos = {arc: k for k, arc in enumerate(arcs)}
-    m_x = len(arcs)
-    u_nodes = [node for node in nodes if node != depot]
-    u_pos = {node: m_x + k for k, node in enumerate(u_nodes)}
-    total_vars = m_x + len(u_nodes)
+@st.cache_data
+def solve_tsp(dist):
+    start = time.time()
+    n = len(dist)
+    arcs = [(i, j) for i in range(n) for j in range(n) if i != j]
+    mx = len(arcs)
+    mu = n - 1
+    total_vars = mx + mu
 
     c = np.zeros(total_vars)
     for k, (i, j) in enumerate(arcs):
-        c[k] = float(matrix.loc[i, j])
+        c[k] = dist[i, j]
 
-    integrality = np.zeros(total_vars)
-    integrality[:m_x] = 1
-    lb = np.zeros(total_vars)
-    ub = np.full(total_vars, np.inf)
-    ub[:m_x] = 1
-    for node in u_nodes:
-        lb[u_pos[node]] = 1
-        ub[u_pos[node]] = n - 1
+    constraints = []
+    lb = []
+    ub = []
 
-    n_constraints = 2 * n + (n - 1) * (n - 2)
-    A = lil_matrix((n_constraints, total_vars))
-    b_l = np.full(n_constraints, -np.inf)
-    b_u = np.full(n_constraints, np.inf)
-    row = 0
+    for i in range(n):
+        row = np.zeros(total_vars)
+        for k, (a, b) in enumerate(arcs):
+            if a == i:
+                row[k] = 1
+        constraints.append(row); lb.append(1); ub.append(1)
 
-    for i in nodes:
-        for j in nodes:
-            if i != j:
-                A[row, arc_pos[(i, j)]] = 1
-        b_l[row] = b_u[row] = 1
-        row += 1
+    for j in range(n):
+        row = np.zeros(total_vars)
+        for k, (a, b) in enumerate(arcs):
+            if b == j:
+                row[k] = 1
+        constraints.append(row); lb.append(1); ub.append(1)
 
-    for j in nodes:
-        for i in nodes:
-            if i != j:
-                A[row, arc_pos[(i, j)]] = 1
-        b_l[row] = b_u[row] = 1
-        row += 1
+    arc_index = {arc: k for k, arc in enumerate(arcs)}
+    for i in range(1, n):
+        for j in range(1, n):
+            if i == j:
+                continue
+            row = np.zeros(total_vars)
+            row[mx + i - 1] = 1
+            row[mx + j - 1] = -1
+            row[arc_index[(i, j)]] = n
+            constraints.append(row); lb.append(-np.inf); ub.append(n - 1)
 
-    for i in u_nodes:
-        for j in u_nodes:
-            if i != j:
-                A[row, u_pos[i]] = 1
-                A[row, u_pos[j]] = -1
-                A[row, arc_pos[(i, j)]] = n
-                b_u[row] = n - 1
-                row += 1
+    integrality = np.ones(total_vars)
+    lb_var = np.zeros(total_vars)
+    ub_var = np.ones(total_vars)
+    for i in range(1, n):
+        idx = mx + i - 1
+        lb_var[idx] = 1
+        ub_var[idx] = n - 1
+        integrality[idx] = 0
 
-    start = time.time()
-    result = milp(
-        c=c,
+    res = milp(
+        c,
         integrality=integrality,
-        bounds=Bounds(lb, ub),
-        constraints=LinearConstraint(A.tocsr(), b_l, b_u),
-        options={"time_limit": time_limit, "mip_rel_gap": 0.0, "disp": False},
+        bounds=Bounds(lb_var, ub_var),
+        constraints=LinearConstraint(np.vstack(constraints), lb, ub),
+        options={"time_limit": 300, "mip_rel_gap": 0}
     )
+
     elapsed = time.time() - start
-    output = {"elapsed": elapsed, "num_vars": total_vars, "num_constraints": n_constraints, "message": result.message}
-    if not result.success:
-        output["success"] = False
-        return output
+    if not res.success:
+        return {"success": False, "message": res.message, "time": elapsed}
 
-    chosen = [arcs[k] for k, val in enumerate(result.x[:m_x]) if val > 0.5]
-    next_node = {i: j for i, j in chosen}
-    route = [depot]
-    current = depot
-    for _ in range(n + 2):
-        current = next_node.get(current)
-        if current is None:
+    x = res.x[:mx]
+    selected_idx = [(i, j) for k, (i, j) in enumerate(arcs) if x[k] > 0.5]
+    succ = {i: j for i, j in selected_idx}
+    route_idx = [0]
+    current = 0
+    while True:
+        current = succ[current]
+        route_idx.append(current)
+        if current == 0:
             break
-        route.append(current)
-        if current == depot:
+        if len(route_idx) > n + 1:
             break
-    output.update({"success": True, "objective": float(result.fun), "route": route, "chosen_arcs": chosen})
-    return output
 
-def zip_outputs(files: dict):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for name, content in files.items():
-            if isinstance(content, str):
-                content = content.encode("utf-8")
-            zf.writestr(name, content)
-    buffer.seek(0)
-    return buffer
+    route_nodes = [NODES[i] for i in route_idx]
+    selected_arcs = [(NODES[i], NODES[j], int(dist[i, j])) for i, j in selected_idx]
 
-def local_bytes(path: Path):
-    return path.read_bytes()
+    return {
+        "success": True,
+        "objective": float(res.fun),
+        "route": route_nodes,
+        "selected_arcs": selected_arcs,
+        "time": elapsed,
+        "variables": total_vars,
+        "binary_variables": mx,
+        "mtz_variables": mu,
+        "constraints": len(constraints),
+        "out_constraints": n,
+        "in_constraints": n,
+        "mtz_constraints": (n - 1) * (n - 2),
+        "message": res.message,
+    }
 
-with st.sidebar:
-    st.header("📂 Datos")
-    use_example = st.checkbox("Usar archivos incluidos", value=True)
-    red_file = st.file_uploader("Red vial (.nf o .txt)", type=["nf", "txt"])
-    clientes_file = st.file_uploader("Clientes (.txt)", type=["txt"])
-    st.divider()
-    st.header("⚙️ Configuración")
-    time_limit = st.slider("Tiempo límite para TSP exacto", 30, 900, 180, step=30)
-    st.caption("La app genera los archivos AMPL. El TSP exacto puede tardar bastante en instancias grandes.")
+def make_dat():
+    lines = []
+    lines.append("set NODES := " + " ".join(map(str, NODES)) + ";")
+    lines.append("param depot := 0;")
+    lines.append("param d : " + " ".join(map(str, NODES)) + " :=")
+    for node, row in zip(NODES, D.astype(int)):
+        lines.append(str(node) + " " + " ".join(map(str, row)))
+    lines.append(";")
+    return "\n".join(lines)
 
-try:
-    if use_example and red_file is None and clientes_file is None:
-        red_bytes = local_bytes(DATA_DIR / "Red1.nf")
-        clientes_bytes = local_bytes(DATA_DIR / "Clientes1.txt")
-    elif red_file is not None and clientes_file is not None:
-        red_bytes = red_file.getvalue()
-        clientes_bytes = clientes_file.getvalue()
-    else:
-        st.info("Subí ambos archivos o dejá marcada la opción de usar los archivos incluidos.")
-        st.stop()
+def make_mod():
+    return """set NODES;
+param n := card(NODES);
+param d {NODES, NODES} >= 0;
+param depot symbolic in NODES default 0;
 
-    n_nodes, arcs = read_network(red_bytes)
-    clients = read_clients(clientes_bytes)
-except Exception as exc:
-    st.error(f"No se pudieron cargar los datos: {exc}")
-    st.stop()
+var x {i in NODES, j in NODES: i <> j} binary;
+var u {i in NODES: i <> depot} >= 1 <= n-1;
 
-required_nodes = [0] + [c for c in clients if c != 0]
-n_tsp = len(required_nodes)
-num_x = n_tsp * (n_tsp - 1)
-num_u = n_tsp - 1
-num_vars = num_x + num_u
-num_constraints = 2 * n_tsp + (n_tsp - 1) * (n_tsp - 2)
+minimize Distancia_Total:
+    sum {i in NODES, j in NODES: i <> j} d[i,j] * x[i,j];
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Nodos red vial", f"{n_nodes:,}")
-m2.metric("Arcos red vial", f"{len(arcs):,}")
-m3.metric("Clientes", f"{len(clients):,}")
-m4.metric("Nodos TSP", f"{n_tsp:,}")
-m5.metric("Variables MTZ", f"{num_vars:,}")
+subject to Salida_Unica {i in NODES}:
+    sum {j in NODES: j <> i} x[i,j] = 1;
 
-if n_tsp > 70:
-    st.markdown('<div class="warn"><b>Nota:</b> esta instancia es grande para una formulación MTZ exacta en una app web. La app deja evidencia, matriz, archivos .mod/.dat y puede intentar resolver, pero para la entrega formal conviene guardar también una corrida en AMPL con un solver fuerte.</div>', unsafe_allow_html=True)
+subject to Entrada_Unica {j in NODES}:
+    sum {i in NODES: i <> j} x[i,j] = 1;
 
-(tab_resumen, tab_datos, tab_camino, tab_formulacion, tab_tsp, tab_entrega) = st.tabs([
-    "📌 Resumen", "📂 Datos", "🛣️ Camino más corto", "📐 Formulación", "🧩 TSP", "📦 Entregables"
-])
+subject to Eliminar_Subciclos {i in NODES, j in NODES: i <> j and i <> depot and j <> depot}:
+    u[i] - u[j] + n * x[i,j] <= n - 1;
 
-with tab_resumen:
-    a, b = st.columns([1.25, 1])
-    with a:
-        st.markdown("""
-        <div class="card">
-        <h3 style="margin-top:0">Flujo de solución</h3>
-        <ol>
-          <li>Leer la red vial con formato <b>NodoOrigen NodoDestino Distancia</b>.</li>
-          <li>Leer los clientes y agregar el depósito como nodo 0.</li>
-          <li>Calcular caminos más cortos entre todos los puntos requeridos.</li>
-          <li>Construir la matriz Desde-Hasta.</li>
-          <li>Formular y resolver el TSP sobre la matriz reducida.</li>
-        </ol>
-        </div>
-        """, unsafe_allow_html=True)
-    with b:
-        st.markdown(f"""
-        <div class="card">
-        <h3 style="margin-top:0">Tamaño esperado del TSP</h3>
-        <p><b>Nodos:</b> {n_tsp}</p>
-        <p><b>Variables binarias xᵢⱼ:</b> {num_x:,}</p>
-        <p><b>Variables MTZ uᵢ:</b> {num_u:,}</p>
-        <p><b>Restricciones:</b> {num_constraints:,}</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-with tab_datos:
-    left, right = st.columns([2, 1])
-    with left:
-        st.subheader("Red vial")
-        st.dataframe(arcs.head(80), use_container_width=True, hide_index=True)
-        st.caption("Se muestra una vista previa de los primeros arcos.")
-    with right:
-        st.subheader("Puntos de entrega")
-        st.dataframe(pd.DataFrame({"cliente": clients}), use_container_width=True, hide_index=True)
-        st.download_button("Descargar clientes usados", pd.DataFrame({"cliente": clients}).to_csv(index=False).encode("utf-8"), "clientes_usados.csv", "text/csv")
-
-with tab_camino:
-    st.subheader("Parte 1 · Matriz Desde-Hasta")
-    st.write("Aquí se calcula el camino más corto entre el depósito y cada cliente, y entre cada par de clientes. Ese resultado es la matriz que alimenta el TSP.")
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        calc_paths = st.button("Calcular matriz Desde-Hasta", type="primary", use_container_width=True)
-    with col_b:
-        st.markdown('<div class="soft">El cálculo usa Dijkstra sobre la red vial original.</div>', unsafe_allow_html=True)
-
-    if calc_paths:
-        start = time.time()
-        with st.spinner("Calculando caminos más cortos..."):
-            matrix, pred = build_distance_and_paths(n_nodes, arcs, tuple(required_nodes))
-        st.session_state["matrix"] = matrix
-        st.session_state["pred"] = pred
-        st.session_state["matrix_time"] = time.time() - start
-
-    if "matrix" in st.session_state:
-        matrix = st.session_state["matrix"]
-        st.success(f"Matriz Desde-Hasta calculada en {st.session_state.get('matrix_time', 0):.2f} segundos.")
-        c_a, c_b, c_c = st.columns(3)
-        c_a.metric("Filas", matrix.shape[0])
-        c_b.metric("Columnas", matrix.shape[1])
-        c_c.metric("Pares sin camino", int(np.isinf(matrix.values).sum()))
-        st.dataframe(matrix, use_container_width=True)
-        st.download_button("Descargar matriz Desde-Hasta CSV", matrix.to_csv(index=True).encode("utf-8"), "matriz_desde_hasta.csv", "text/csv", use_container_width=True)
-
-        st.subheader("Ejemplo de camino más corto")
-        e1, e2, e3 = st.columns([1, 1, 2])
-        with e1:
-            origen_ej = st.selectbox("Origen", required_nodes, index=0)
-        with e2:
-            destino_ej = st.selectbox("Destino", required_nodes, index=min(1, len(required_nodes)-1))
-        if st.button("Mostrar camino elegido"):
-            path = reconstruct_path(st.session_state["pred"], required_nodes, origen_ej, destino_ej)
-            if path:
-                st.code(" -> ".join(map(str, path)))
-                st.write(f"Distancia mínima: **{float(matrix.loc[origen_ej, destino_ej]):.0f}**")
-            else:
-                st.warning("No se encontró camino entre esos nodos.")
-    else:
-        st.info("Presioná el botón para calcular la matriz.")
-
-with tab_formulacion:
-    st.subheader("Parte 2 · Formulación matemática")
-    st.markdown(r"""
-    **Conjuntos:**  
-    $N$: depósito y clientes. El depósito es el nodo 0.  
-
-    **Parámetro:**  
-    $d_{ij}$: distancia mínima desde el nodo $i$ hasta el nodo $j$, calculada con caminos más cortos.  
-
-    **Variables:**  
-    $x_{ij}=1$ si se viaja directamente de $i$ a $j$ en la ruta TSP; $0$ en caso contrario.  
-    $u_i$: variable de orden usada para eliminar subciclos.  
-
-    **Función objetivo:**  
-    $$\min \sum_{i\in N}\sum_{j\in N, j\ne i} d_{ij}x_{ij}$$
-
-    **Restricciones principales:**  
-    Salida única: $$\sum_{j\in N,j\ne i}x_{ij}=1 \quad \forall i\in N$$  
-    Entrada única: $$\sum_{i\in N,i\ne j}x_{ij}=1 \quad \forall j\in N$$  
-    Eliminación de subciclos MTZ: $$u_i-u_j+n x_{ij}\le n-1$$
-    """)
-    st.subheader("Modelo AMPL TSP.mod")
-    st.code((AMPL_DIR / "TSP.mod").read_text(encoding="utf-8"), language="ampl")
-    st.subheader("Modelo AMPL CaminoMasCorto.mod")
-    st.code((AMPL_DIR / "CaminoMasCorto.mod").read_text(encoding="utf-8"), language="ampl")
-
-with tab_tsp:
-    st.subheader("Parte 3 y 4 · Implementación y resultados TSP")
-    if "matrix" not in st.session_state:
-        st.info("Primero calculá la matriz Desde-Hasta en la pestaña de Camino más corto.")
-    else:
-        matrix = st.session_state["matrix"]
-        tsp_dat = make_tsp_dat(matrix)
-        shortest_dat = make_shortest_dat(n_nodes, arcs, required_nodes[0], required_nodes[1])
-        files = {
-            "ampl/TSP.mod": (AMPL_DIR / "TSP.mod").read_text(encoding="utf-8"),
-            "ampl/TSP.dat": tsp_dat,
-            "ampl/CaminoMasCorto.mod": (AMPL_DIR / "CaminoMasCorto.mod").read_text(encoding="utf-8"),
-            "ampl/CaminoMasCorto.dat": shortest_dat,
-            "outputs/matriz_desde_hasta.csv": matrix.to_csv(index=True),
-        }
-        st.download_button("Descargar paquete .mod, .dat y matriz", zip_outputs(files), "resultados_ampl_tsp.zip", "application/zip", use_container_width=True)
-        with st.expander("Vista previa del TSP.dat generado"):
-            st.code(tsp_dat[:16000] + ("\n..." if len(tsp_dat) > 16000 else ""), language="ampl")
-
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Variables del modelo", f"{num_vars:,}")
-        r2.metric("Restricciones", f"{num_constraints:,}")
-        r3.metric("Nodos visitados", f"{n_tsp}")
-
-        if st.button("Resolver TSP exacto en Streamlit", type="primary", use_container_width=True):
-            with st.spinner("Resolviendo TSP con MILP + MTZ. Puede tardar según la instancia..."):
-                try:
-                    result = solve_tsp_mtz_scipy(matrix, time_limit)
-                except Exception as exc:
-                    result = {"success": False, "elapsed": 0, "num_vars": num_vars, "num_constraints": num_constraints, "message": str(exc)}
-            st.session_state["tsp_result"] = result
-
-        if "tsp_result" in st.session_state:
-            result = st.session_state["tsp_result"]
-            a, b, c, d = st.columns(4)
-            b.metric("Tiempo solución", f"{result.get('elapsed', 0):.2f} s")
-            c.metric("Variables", f"{result.get('num_vars', num_vars):,}")
-            d.metric("Restricciones", f"{result.get('num_constraints', num_constraints):,}")
-            if result.get("success"):
-                a.metric("Distancia total", f"{result['objective']:.0f}")
-                st.markdown('<div class="ok"><b>Solución TSP encontrada.</b> La ruta inicia y finaliza en el depósito 0.</div>', unsafe_allow_html=True)
-                st.code(" -> ".join(map(str, result["route"])))
-                rt = route_table(result["route"], matrix)
-                st.dataframe(rt, use_container_width=True, hide_index=True)
-                st.download_button("Descargar ruta óptima CSV", rt.to_csv(index=False).encode("utf-8"), "ruta_tsp.csv", "text/csv", use_container_width=True)
-            else:
-                a.metric("Distancia total", "No certificada")
-                st.error("No se logró certificar una solución óptima dentro del tiempo configurado.")
-                st.write(result.get("message", "Sin mensaje del solver."))
-                st.markdown('<div class="warn">Para la evidencia formal, descargá el TSP.dat y corré TSP.mod en AMPL con CPLEX, Gurobi o HiGHS.</div>', unsafe_allow_html=True)
-
-with tab_entrega:
-    st.subheader("Checklist alineado con la rúbrica")
-    checklist = pd.DataFrame({
-        "Punto solicitado": [
-            "Formulación, implementación y resultados de Camino Más Corto",
-            "Formulación matemática TSP",
-            "Implementación en AMPL TSP",
-            "Solución del modelo TSP",
-            "Presentación e interpretación de resultados",
-            "Organización y documentación del código",
-        ],
-        "Dónde está en la app": [
-            "Pestaña Camino más corto + matriz Desde-Hasta + CSV",
-            "Pestaña Formulación",
-            "TSP.mod y TSP.dat descargables",
-            "Pestaña TSP / corrida en AMPL",
-            "Métricas, ruta, distancia, tiempo, variables y restricciones",
-            "README + archivos separados por carpetas",
-        ],
-    })
-    st.dataframe(checklist, use_container_width=True, hide_index=True)
-    st.subheader("Preguntas de análisis que se responden con la corrida")
-    st.markdown(f"""
-    - **Secuencia óptima de visitas:** se muestra en la pestaña TSP cuando el solver encuentra solución.
-    - **Distancia total recorrida:** se reporta como métrica principal del TSP.
-    - **Tamaño del modelo:** para esta instancia son **{num_vars:,} variables** y **{num_constraints:,} restricciones**.
-    - **Limitaciones:** la formulación MTZ crece rápido porque usa muchas variables binarias y restricciones de subciclos.
-    - **Mejoras:** usar solvers más fuertes, cortes de subciclos dinámicos, formulaciones más ajustadas o descomposición para instancias mayores.
-    """)
-    st.subheader("Comandos sugeridos en AMPL")
-    st.code(
-        """reset;
-model ampl/TSP.mod;
-data ampl/TSP.dat;
-option solver cplex;   # también puede usarse gurobi o highs si están disponibles
 solve;
 display Distancia_Total;
 display x;
-display u;""",
-        language="ampl",
-    )
+display u;
+"""
+
+def package_zip(result):
+    mem = io.BytesIO()
+    df = pd.DataFrame(D.astype(int), index=NODES, columns=NODES)
+    route_text = " → ".join(map(str, result["route"])) if result.get("success") else "Sin solución"
+    arcs_df = pd.DataFrame(result.get("selected_arcs", []), columns=["origen", "destino", "distancia"])
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("data/matriz_13.csv", df.to_csv(index=True))
+        z.writestr("ampl/TSP_13.mod", make_mod())
+        z.writestr("ampl/TSP_13.dat", make_dat())
+        z.writestr("resultados/ruta_optima.txt", route_text)
+        z.writestr("resultados/arcos_seleccionados.csv", arcs_df.to_csv(index=False))
+        z.writestr("resultados/resumen.txt", f"Distancia total: {result.get('objective')}\nTiempo: {result.get('time'):.4f} segundos\nVariables: {result.get('variables')}\nRestricciones: {result.get('constraints')}\n")
+    mem.seek(0)
+    return mem
+
+st.title("Caso 2 · Camino más corto + TSP")
+st.markdown('<div class="subtitle">Instancia reducida de 13 puntos: depósito 0 + 12 clientes</div>', unsafe_allow_html=True)
+
+tabs = st.tabs(["📌 Enfoque", "📊 Matriz", "🧮 Formulación", "🚚 Resolver TSP", "📝 Respuestas", "📦 Entregables"])
+
+with tabs[0]:
+    st.header("Caso 2 · enfoque por etapas")
+    c1, c2 = st.columns([1, 1.35])
+    with c1:
+        st.markdown('<div class="card"><h3>El problema</h3><p>Una empresa sale del depósito 0, visita 12 clientes y regresa al depósito, recorriendo la menor distancia total.</p><p><b>13 puntos relevantes:</b><br>0 · 3 · 10 · 21 · 22 · 35 · 40 · 41 · 47 · 65 · 71 · 76 · 77</p></div>', unsafe_allow_html=True)
+    with c2:
+        st.markdown('<div class="card"><h3>Flujo en dos etapas</h3><p><b>Red vial original</b> → caminos más cortos → <b>Matriz Desde-Hasta 13×13</b> → TSP exacto → ruta óptima.</p><p>La matriz ya resume la distancia mínima entre cada par de puntos, por eso el TSP se resuelve sobre esta red reducida.</p></div>', unsafe_allow_html=True)
+
+with tabs[1]:
+    st.header("Matriz de distancias completa")
+    df = pd.DataFrame(D.astype(int), index=NODES, columns=NODES)
+    st.dataframe(df, use_container_width=True)
+    st.download_button("Descargar matriz CSV", df.to_csv(index=True).encode("utf-8"), "matriz_13.csv", "text/csv")
+
+with tabs[2]:
+    st.header("Formulación matemática del TSP")
+    st.markdown(r"""
+**Función objetivo:** minimizar la distancia total recorrida.
+
+$$\min \sum_{i \in N}\sum_{j \in N, j \ne i} d_{ij}x_{ij}$$
+
+**Salida única:** cada punto debe tener exactamente una salida.
+
+$$\sum_{j \in N, j \ne i} x_{ij}=1 \quad \forall i \in N$$
+
+**Entrada única:** cada punto debe tener exactamente una entrada.
+
+$$\sum_{i \in N, i \ne j} x_{ij}=1 \quad \forall j \in N$$
+
+**Eliminación de subciclos MTZ:** evita ciclos separados que no incluyan todos los puntos.
+
+$$u_i-u_j+n x_{ij}\le n-1 \quad \forall i,j \ne 0, i\ne j$$
+""")
+    st.subheader("Modelo AMPL")
+    st.code(make_mod(), language="ampl")
+
+with tabs[3]:
+    st.header("Implementación y resultados del TSP")
+    result = solve_tsp(D)
+    if not result["success"]:
+        st.error("No se encontró solución: " + str(result["message"]))
+    else:
+        a, b, c, d = st.columns(4)
+        a.metric("Distancia total", f"{result['objective']:.0f}")
+        b.metric("Tiempo de solución", f"{result['time']:.4f} s")
+        c.metric("Variables", result["variables"])
+        d.metric("Restricciones", result["constraints"])
+        st.subheader("Secuencia óptima de visita")
+        st.markdown(f'<div class="route">{" → ".join(map(str, result["route"]))}</div>', unsafe_allow_html=True)
+        st.subheader("Arcos seleccionados")
+        st.dataframe(pd.DataFrame(result["selected_arcs"], columns=["origen", "destino", "distancia"]), use_container_width=True)
+        st.success("Solución óptima encontrada con SciPy/HiGHS mediante formulación MTZ.")
+
+with tabs[4]:
+    st.header("Respuestas a las preguntas")
+    result = solve_tsp(D)
+    route_text = " → ".join(map(str, result["route"]))
+    answers = [
+        ("1. ¿Por qué no se resuelve el TSP directamente sobre toda la red vial original?", "Porque la red vial contiene muchas calles e intersecciones que no son puntos de entrega. Primero se calcula la distancia mínima entre los puntos relevantes y luego se trabaja con una matriz reducida 13×13, lo que conserva la información necesaria y hace el modelo más manejable."),
+        ("2. ¿Qué representa una solución del TSP?", "Representa el orden en que el vehículo debe salir del depósito, visitar cada cliente exactamente una vez y regresar al depósito, minimizando la distancia total recorrida."),
+        ("3. ¿Por qué esta instancia corre sin licencia comercial?", f"Porque solo tiene 13 puntos. El modelo genera {result['variables']} variables y {result['constraints']} restricciones, mucho menos que resolver sobre una red vial completa con cientos de nodos y miles de arcos."),
+        ("4. Función objetivo del TSP", "La función objetivo minimiza la suma de las distancias de los arcos seleccionados: min Σ dᵢⱼxᵢⱼ. Es decir, busca la ruta total más corta."),
+        ("5. Restricciones de salida y entrada", "Para cada punto se impone una salida única: Σ xᵢⱼ = 1, y una entrada única: Σ xᵢⱼ = 1. Con esto, cada cliente queda conectado una sola vez en la ruta."),
+        ("6. Restricciones de eliminación de subciclos", "Las restricciones MTZ evitan que se formen ciclos pequeños separados del depósito. Son necesarias porque entrada y salida únicas por sí solas no garantizan una sola ruta completa."),
+        ("7. Resultado del modelo", f"La distancia total óptima es {result['objective']:.0f}. La secuencia óptima es: {route_text}. Los arcos seleccionados aparecen en la pestaña Resolver TSP."),
+        ("8. Si se agrega un cliente nuevo", "El tamaño del modelo aumenta rápido: con n puntos hay n(n−1) variables binarias xᵢⱼ y (n−1)(n−2) restricciones MTZ. Por eso un cliente adicional agrega muchas combinaciones nuevas."),
+        ("9. Si una distancia aumenta", "La ruta óptima puede cambiar porque el solver intentará evitar arcos más costosos. Si ese arco era parte de la ruta óptima, posiblemente se sustituya por otra conexión con menor impacto en la distancia total."),
+        ("10. Información adicional para reconstruir la ruta vial completa", "Además de la distancia mínima, se debe guardar la secuencia de nodos intermedios de cada camino más corto. Así se puede pasar de la ruta entre clientes a la ruta real sobre calles."),
+    ]
+    for q, ans in answers:
+        st.markdown(f'<div class="answer"><b>{q}</b><br><br>{ans}</div>', unsafe_allow_html=True)
+
+with tabs[5]:
+    st.header("Archivos para entregar")
+    result = solve_tsp(D)
+    st.download_button("Descargar paquete .mod, .dat, matriz y resultados", package_zip(result), "caso2_tsp_13_entregables.zip", "application/zip")
+    st.subheader("TSP_13.dat")
+    st.code(make_dat(), language="ampl")
+    st.info("Para evidencia formal en AMPL: model ampl/TSP_13.mod; data ampl/TSP_13.dat; option solver highs; solve; display Distancia_Total; display x;")
